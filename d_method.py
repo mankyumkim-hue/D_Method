@@ -1,6 +1,9 @@
 import re
 import sys
-from datetime import datetime, timedelta
+import traceback
+import urllib.request
+from dataclasses import dataclass
+from datetime import datetime, time, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -22,7 +25,8 @@ except Exception:
     stock = None
 
 from watch_selection import DEMO_OPEN_PRICES, select_watch_candidates
-from order_manager import BuySellOrderManager
+from order_manager import BuyFillEvent, BuySellOrderManager, RealtimeQuote, SellFillEvent, to_int
+from trade_summary import append_trade_summaries_csv
 from columns import (
     LIST0_COLUMNS,
     LIST0_MONEY_COLUMNS,
@@ -35,6 +39,16 @@ from columns import (
     QTY_COLUMNS,
 )
 from state_store import load_state_file, save_state_file
+
+
+@dataclass
+class TestQuote:
+    code: str
+    open_price: int
+    low_price: int
+    current_price: int
+    accumulated_volume: int
+    event_time: datetime
 
 
 def parse_int(text: str) -> int:
@@ -85,6 +99,11 @@ class PendingKiwoomOrderClient:
         self.sell_log(f"{name}: 키움 API 미연결 - 잔여 지정가 매도 취소를 실행하지 않았습니다.")
         return False
 
+    def cancel_sell_order(self, row: Dict[str, Any], order_no: str) -> bool:
+        name = row.get("종목명") or row.get("종목코드") or ""
+        self.sell_log(f"{name}: 키움 API 미연결 - 지정가 매도 취소를 실행하지 않았습니다. ({order_no})")
+        return False
+
     def send_market_sell_order(self, row: Dict[str, Any], qty: int) -> Optional[str]:
         name = row.get("종목명") or row.get("종목코드") or ""
         self.sell_log(f"{name}: 키움 API 미연결 - 시장가 매도를 실행하지 않았습니다. ({qty}주)")
@@ -104,6 +123,7 @@ class DMainWindow(QMainWindow):
         super().__init__()
         self.base_dir = Path(__file__).resolve().parent
         self.state_path = self.base_dir / "D_Ver1_state.json"
+        self.summary_csv_path = self.base_dir / "trade_summary.csv"
         self._dirty = False
 
         ui_path = self._resolve_ui_path()
@@ -117,6 +137,7 @@ class DMainWindow(QMainWindow):
         self._init_tables()
         self._connect_signals()
         self.load_state()
+        self._summary_csv_saved_count = len(self.list3)
         self.order_manager = self._create_order_manager()
         self.refresh_all_tables()
 
@@ -157,12 +178,22 @@ class DMainWindow(QMainWindow):
         self.textEdit_Summary: Optional[QTextEdit] = self._get(["textEdit_Summary", "textEdit_D0_Summary"], required=False)
         self.textEdit_reg: Optional[QTextEdit] = self._get(["textEdit_reg"], required=False)
 
+        self.test_code: Optional[QLineEdit] = self._get(["test_code"], required=False)
+        self.test_s: Optional[QLineEdit] = self._get(["test_s"], required=False)
+        self.test_l: Optional[QLineEdit] = self._get(["test_l"], required=False)
+        self.test_c: Optional[QLineEdit] = self._get(["test_c"], required=False)
+        self.test_t: Optional[QLineEdit] = self._get(["test_t"], required=False)
+        self.test_time: Optional[QLineEdit] = self._get(["test_time", "test_code_2"], required=False)
+
         self.pushButton_ini: Optional[QPushButton] = self._get(["pushButton_ini"], required=False)
         self.pushButton_reg: Optional[QPushButton] = self._get(["pushButton_reg", "pushButton_D0_1"], required=False)
+        self.pushButton_reg_D1: Optional[QPushButton] = self._get(["pushButton_reg_D1"], required=False)
         self.pushButton_reg_c: Optional[QPushButton] = self._get(["pushButton_reg_c", "pushButton_D0_2"], required=False)
         self.pushButton_Start: Optional[QPushButton] = self._get(["pushButton_Start"], required=False)
         self.pushButton_Stop: Optional[QPushButton] = self._get(["pushButton_Stop"], required=False)
         self.pushButton_demo: Optional[QPushButton] = self._get(["pushButton_demo"], required=False)
+        self.test_buy: Optional[QPushButton] = self._get(["test_buy"], required=False)
+        self.test_sell: Optional[QPushButton] = self._get(["test_sell"], required=False)
         self.pushButton_Save: Optional[QPushButton] = self._get(["pushButton_Save"], required=False)
         self.pushButton_End: Optional[QPushButton] = self._get(["pushButton_End"], required=False)
 
@@ -186,15 +217,21 @@ class DMainWindow(QMainWindow):
         if self.pushButton_ini:
             self.pushButton_ini.clicked.connect(self.on_initialize)
         if self.pushButton_reg:
-            self.pushButton_reg.clicked.connect(lambda: self.register_symbol("일반"))
+            self.pushButton_reg.clicked.connect(lambda: self._run_ui_action(lambda: self.register_symbol("일반"), "종목 등록"))
+        if self.pushButton_reg_D1:
+            self.pushButton_reg_D1.clicked.connect(lambda: self._run_ui_action(lambda: self.register_symbol("D1"), "D1 종목 등록"))
         if self.pushButton_reg_c:
-            self.pushButton_reg_c.clicked.connect(lambda: self.register_symbol("신용"))
+            self.pushButton_reg_c.clicked.connect(lambda: self._run_ui_action(lambda: self.register_symbol("신용"), "신용 종목 등록"))
         if self.pushButton_Start:
             self.pushButton_Start.clicked.connect(self.start_watch_all)
         if self.pushButton_Stop:
             self.pushButton_Stop.clicked.connect(self.stop_watch_all)
         if self.pushButton_demo:
             self.pushButton_demo.clicked.connect(self.run_demo_watch_selection)
+        if self.test_buy:
+            self.test_buy.clicked.connect(self.run_test_buy_tick)
+        if self.test_sell:
+            self.test_sell.clicked.connect(self.run_test_sell_tick)
         if self.pushButton_Save:
             self.pushButton_Save.clicked.connect(self.save_state)
         if self.pushButton_End:
@@ -202,6 +239,16 @@ class DMainWindow(QMainWindow):
 
         for edit in self.findChildren(QLineEdit):
             edit.textChanged.connect(self.mark_dirty)
+
+    def _run_ui_action(self, action, title: str) -> None:
+        try:
+            action()
+        except Exception as exc:
+            message = f"{title} 중 오류가 발생했습니다.\n{exc}"
+            if self.textEdit_reg:
+                self.textEdit_reg.append(message)
+                self.textEdit_reg.append(traceback.format_exc())
+            QMessageBox.critical(self, title, message)
 
     def _create_order_manager(self) -> BuySellOrderManager:
         return BuySellOrderManager(
@@ -235,8 +282,17 @@ class DMainWindow(QMainWindow):
         return int((cost / buy_price) + 0.5)
 
     def _normalize_code(self, raw: str) -> str:
-        code = re.sub(r"\D", "", raw or "")
-        return code.zfill(6) if code else ""
+        code = re.sub(r"[^0-9A-Za-z]", "", raw or "").upper()
+        if not code:
+            return ""
+        return code.zfill(6) if code.isdigit() else code
+
+    def _extract_name_hint(self, raw: str, code: str) -> Optional[str]:
+        if not raw or not code:
+            return None
+        name = re.sub(re.escape(code), "", raw, flags=re.IGNORECASE)
+        name = re.sub(r"[0-9A-Za-z]", "", name).strip()
+        return name or None
 
     def _parse_optional_sell(self, edit: Optional[QLineEdit]) -> Optional[int]:
         text = self._line_text(edit)
@@ -247,12 +303,8 @@ class DMainWindow(QMainWindow):
             return None
         return value
 
-    def _fetch_name_and_close(self, code: str) -> Optional[Dict[str, Any]]:
+    def _fetch_name_and_close(self, code: str, name_hint: Optional[str] = None) -> Optional[Dict[str, Any]]:
         if stock is None:
-            return None
-
-        name = stock.get_market_ticker_name(code)
-        if not name:
             return None
 
         now = datetime.now()
@@ -260,6 +312,7 @@ class DMainWindow(QMainWindow):
         start = (today - timedelta(days=45)).strftime("%Y%m%d")
         end = today.strftime("%Y%m%d")
 
+        name = self._fetch_ticker_name(code, name_hint) or code
         try:
             df = stock.get_market_ohlcv_by_date(start, end, code)
         except Exception:
@@ -284,8 +337,58 @@ class DMainWindow(QMainWindow):
         volume = int(ref_row["거래량"]) if "거래량" in ref_row.index else None
         return {"name": name, "close": close, "volume": volume}
 
+    def _fetch_ticker_name(self, code: str, name_hint: Optional[str] = None) -> Optional[str]:
+        name = self._fetch_ticker_name_from_pykrx(code)
+        if name:
+            return name
+        name = self._find_ticker_name_in_local_rows(code)
+        if name:
+            return name
+        if name_hint:
+            return name_hint
+        return self._fetch_ticker_name_from_naver(code)
+
+    def _fetch_ticker_name_from_pykrx(self, code: str) -> Optional[str]:
+        if stock is None:
+            return None
+        try:
+            name = stock.get_market_ticker_name(code)
+        except Exception:
+            return None
+        if isinstance(name, str) and name.strip() and name.strip() != code:
+            return name.strip()
+        return None
+
+    def _find_ticker_name_in_local_rows(self, code: str) -> Optional[str]:
+        for rows in (self.list0, self.list1, self.list2, self.list3):
+            for row in rows:
+                if str(row.get("종목코드", "")) != code:
+                    continue
+                name = str(row.get("종목명", "")).strip()
+                if name and name != code:
+                    return name
+        return None
+
+    def _fetch_ticker_name_from_naver(self, code: str) -> Optional[str]:
+        url = f"https://finance.naver.com/item/main.naver?code={code}"
+        request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        try:
+            with urllib.request.urlopen(request, timeout=3) as response:
+                encoding = response.headers.get_content_charset() or "utf-8"
+                html = response.read().decode(encoding, errors="ignore")
+        except Exception:
+            return None
+
+        match = re.search(r"<title>\s*(.*?)\s*[:|]", html, re.IGNORECASE | re.DOTALL)
+        if not match:
+            return None
+        name = re.sub(r"\s+", " ", match.group(1)).strip()
+        return name if name and name != code else None
+
     def register_symbol(self, buy_type: str) -> None:
-        code = self._normalize_code(self._line_text(self.lineEdit_code))
+        code_text = self._line_text(self.lineEdit_code)
+        code = self._normalize_code(code_text)
+        name_hint = self._extract_name_hint(code_text, code)
         cost_text = self._line_text(self.lineEdit_Cost)
         buy1_text = self._line_text(self.lineEdit_Buy1)
         sell11_text = self._line_text(self.lineEdit_Sell11)
@@ -325,7 +428,7 @@ class DMainWindow(QMainWindow):
             QMessageBox.warning(self, "입력 오류", "매도가 입력 오류")
             return
 
-        market = self._fetch_name_and_close(code)
+        market = self._fetch_name_and_close(code, name_hint)
         if market is None:
             QMessageBox.warning(self, "입력 오류", "종목 코드 오류")
             return
@@ -411,6 +514,194 @@ class DMainWindow(QMainWindow):
 
         self.mark_dirty()
         self.refresh_all_tables()
+
+    def run_test_buy_tick(self) -> None:
+        quote = self._read_test_quote()
+        if quote is None:
+            return
+
+        row = self._find_row_by_code(self.list1, quote.code)
+        if row is None:
+            self.append_buy_log(f"[매수 테스트] {quote.code}: list1 매수 감시 종목이 아닙니다.")
+            return
+
+        row["시가"] = quote.open_price
+        row["현재가"] = quote.current_price
+        row["저가"] = quote.low_price
+        row["실시간 거래량"] = quote.accumulated_volume
+        self.order_manager.handle_realtime_quote(
+            RealtimeQuote(
+                code=quote.code,
+                current_price=quote.current_price,
+                low_price=quote.low_price,
+                accumulated_volume=quote.accumulated_volume,
+                event_time=quote.event_time,
+            )
+        )
+        if row.get("감시상태") != "감시 중":
+            self.mark_dirty()
+            self.refresh_all_tables()
+            return
+
+        buy_price = to_int(row.get("매수가"))
+        buy_qty = to_int(row.get("매수 수량"))
+        if buy_price <= 0 or buy_qty <= 0:
+            self.append_buy_log(f"[매수 테스트] {self._row_name(row)}: 매수가/수량 오류")
+            return
+        if quote.current_price > buy_price:
+            self.append_buy_log(f"[매수 테스트] {self._row_name(row)}: 감시중..")
+            self.mark_dirty()
+            self.refresh_all_tables()
+            return
+
+        row["매수주문번호"] = "TEST_BUY"
+        row["매수주문상태"] = "전량체결"
+        self.append_buy_log(f"[매수 테스트] {self._row_name(row)}: {buy_price:,}원/{buy_qty}주 매수 체결")
+        self.order_manager.handle_buy_fill(
+            BuyFillEvent(
+                code=quote.code,
+                order_no="TEST_BUY",
+                cumulative_filled_qty=buy_qty,
+                unfilled_qty=0,
+                event_time=quote.event_time,
+            )
+        )
+
+    def run_test_sell_tick(self) -> None:
+        quote = self._read_test_quote()
+        if quote is None:
+            return
+
+        row = self._find_row_by_code(self.list2, quote.code)
+        if row is None:
+            self.append_sell_log(f"[매도 테스트] {quote.code}: list2 매도 감시 종목이 아닙니다.")
+            return
+
+        before_summary_count = len(self.list3)
+        self.order_manager.handle_sell_realtime_quote(
+            RealtimeQuote(
+                code=quote.code,
+                current_price=quote.current_price,
+                low_price=quote.low_price,
+                accumulated_volume=quote.accumulated_volume,
+                event_time=quote.event_time,
+            )
+        )
+
+        row = self._find_row_by_code(self.list2, quote.code)
+        if row is not None:
+            self._fill_test_sell_limits(row, quote)
+
+        row = self._find_row_by_code(self.list2, quote.code)
+        if row is not None:
+            self._fill_test_stop_loss(row, quote)
+
+        self._save_new_trade_summaries(before_summary_count)
+        self.mark_dirty()
+        self.refresh_all_tables()
+
+    def _fill_test_sell_limits(self, row: Dict[str, Any], quote: "TestQuote") -> None:
+        for level in (1, 2, 3):
+            row = self._find_row_by_code(self.list2, quote.code)
+            if row is None:
+                return
+
+            price = to_int(row.get(f"매도가{level}"))
+            qty = self._remaining_sell_level_qty(row, level)
+            if price <= 0 or qty <= 0 or quote.current_price < price:
+                continue
+
+            remaining_qty = max(0, to_int(row.get("잔여 수량")) - qty)
+            self.append_sell_log(f"[매도 테스트] {self._row_name(row)}: 매도가{level} {price:,}원/{qty}주 체결")
+            self.order_manager.handle_sell_fill(
+                SellFillEvent(
+                    code=quote.code,
+                    order_no=str(row.get(f"매도가{level}주문번호") or f"TEST_SELL{level}"),
+                    sell_level=level,
+                    fill_qty=qty,
+                    fill_price=price,
+                    remaining_holding_qty=remaining_qty,
+                    event_time=quote.event_time,
+                )
+            )
+
+    def _fill_test_stop_loss(self, row: Dict[str, Any], quote: "TestQuote") -> None:
+        stop_price = to_int(row.get("손절가"))
+        holding_qty = to_int(row.get("잔여 수량"))
+        if stop_price <= 0 or holding_qty <= 0 or quote.current_price > stop_price:
+            return
+
+        self.append_sell_log(f"[매도 테스트] {self._row_name(row)}: 손절가 도달, {holding_qty}주 시장가 청산")
+        self.order_manager.handle_sell_fill(
+            SellFillEvent(
+                code=quote.code,
+                order_no="TEST_MARKET",
+                sell_level=0,
+                fill_qty=holding_qty,
+                fill_price=quote.current_price,
+                remaining_holding_qty=0,
+                event_time=quote.event_time,
+            )
+        )
+
+    def _save_new_trade_summaries(self, before_summary_count: int) -> None:
+        if len(self.list3) <= before_summary_count:
+            return
+        new_rows = self.list3[before_summary_count:]
+        append_trade_summaries_csv(self.summary_csv_path, new_rows)
+        self._summary_csv_saved_count = len(self.list3)
+        self.append_sell_log(f"[매도 테스트] 매매 결과 CSV 저장: {self.summary_csv_path.name}")
+
+    def _remaining_sell_level_qty(self, row: Dict[str, Any], level: int) -> int:
+        ordered_qty = to_int(row.get(f"매도가{level}주문수량"))
+        if ordered_qty <= 0:
+            ordered_qty = to_int(row.get("잔여 수량"))
+        filled_qty = to_int(row.get(f"매도가{level}체결수량"))
+        return max(0, ordered_qty - filled_qty)
+
+    def _find_row_by_code(self, rows: List[Dict[str, Any]], code: str) -> Optional[Dict[str, Any]]:
+        for row in rows:
+            if str(row.get("종목코드", "")) == str(code):
+                return row
+        return None
+
+    def _row_name(self, row: Dict[str, Any]) -> str:
+        return str(row.get("종목명") or row.get("종목코드") or "")
+
+    def _read_test_quote(self) -> Optional["TestQuote"]:
+        code = self._normalize_code(self._line_text(self.test_code))
+        if not code:
+            QMessageBox.warning(self, "모의 테스트 입력 오류", "종목 코드를 입력하세요.")
+            return None
+
+        open_price = self._line_int(self.test_s)
+        low_price = self._line_int(self.test_l)
+        current_price = self._line_int(self.test_c)
+        volume = self._line_int(self.test_t)
+        if open_price <= 0 or low_price <= 0 or current_price <= 0:
+            QMessageBox.warning(self, "모의 테스트 입력 오류", "시가/저가/현재가를 입력하세요.")
+            return None
+
+        return TestQuote(
+            code=code,
+            open_price=open_price,
+            low_price=low_price,
+            current_price=current_price,
+            accumulated_volume=volume,
+            event_time=self._read_test_datetime(),
+        )
+
+    def _read_test_datetime(self) -> datetime:
+        raw_time = self._line_text(self.test_time)
+        if not raw_time:
+            return datetime.now()
+        try:
+            parsed_time = datetime.strptime(raw_time, "%H:%M").time()
+        except ValueError:
+            QMessageBox.warning(self, "모의 테스트 입력 오류", "현재 시간은 13:20 형식으로 입력하세요.")
+            return datetime.now()
+        today = datetime.now().date()
+        return datetime.combine(today, parsed_time)
 
     def append_buy_log(self, message: str) -> None:
         if self.textEdit_Buy:
