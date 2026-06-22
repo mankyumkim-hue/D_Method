@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
@@ -24,6 +24,12 @@ SELL_STRATEGY_RELOCATED_PROFIT = "재배치익절추적"
 SELL_STATUS_RELOCATION_CANCEL_REQUESTED = "재배치취소요청"
 SELL_STATUS_RELOCATION_LEVEL1_CANCEL_REQUESTED = "재배치1차취소요청"
 SELL_STATUS_CANCEL_REQUESTED = "지정가취소요청"
+SELL_STATUS_STOP_LIMIT_SWITCH = "손절지정가전환"
+SELL_STATUS_STOP_LIMIT_READY = "손절지정가대기"
+SELL_STATUS_STOP_LIMIT_ORDERED = "손절지정가주문중"
+SELL_STATUS_STOP_LIMIT_RESTORE = "손절지정가복구중"
+SELL_STATUS_STOP_LIMIT_TARGET_MARKET = "손절지정가목표시장가전환"
+SELL_STATUS_STOP_LIMIT_CLOSE_WAIT = "손절지정가청산대기"
 SELL_STATUS_MARKET_REQUESTED = "시장가청산요청"
 SELL_STATUS_DONE = "청산완료"
 
@@ -32,6 +38,7 @@ WATCH_STATUS_OFF = "감시 중지"
 
 BUY_RETRY_LIMIT = 1
 PARTIAL_FILL_WAIT_SECONDS = 6
+SELL_CANCEL_TIMEOUT_SECONDS = 30
 
 
 class KiwoomOrderClient(Protocol):
@@ -52,6 +59,9 @@ class KiwoomOrderClient(Protocol):
     def cancel_sell_order(self, row: Dict[str, Any], order_no: str) -> bool:
         """row의 특정 지정가 매도 주문을 취소 요청한다."""
 
+    def cancel_sell_order_qty(self, row: Dict[str, Any], order_no: str, qty: int) -> bool:
+        """row의 특정 지정가 매도 주문 중 qty만큼 부분 취소 요청한다."""
+
     def send_market_sell_order(self, row: Dict[str, Any], qty: int) -> Optional[str]:
         """row의 잔여 보유수량을 시장가로 매도 요청하고, 접수된 주문번호를 반환한다."""
 
@@ -61,13 +71,21 @@ class KiwoomOrderClient(Protocol):
     def stop_realtime_watch(self, row: Dict[str, Any]) -> None:
         """실시간 감시를 중단한다."""
 
+    def request_account_balance_sync(self, reason: str = "") -> bool:
+        """HTS 계좌 잔고 조회를 요청한다."""
+
+    def request_trade_fill_sync(self, row: Dict[str, Any], reason: str = "") -> bool:
+        """HTS 체결내역 조회를 요청한다."""
+
 
 @dataclass
 class BuyFillEvent:
     code: str
     order_no: str
+    fill_qty: int
     cumulative_filled_qty: int
     unfilled_qty: int
+    fill_price: int
     event_time: datetime
 
 
@@ -102,6 +120,23 @@ class SellFillEvent:
 
 
 @dataclass
+class AccountBalanceSyncEvent:
+    positions: Dict[str, int]
+    event_time: datetime
+
+
+@dataclass
+class TradeFillSyncEvent:
+    code: str
+    buy_qty: int
+    buy_amount: int
+    sell_qty: int
+    sell_amount: int
+    average_sell_price: int
+    event_time: datetime
+
+
+@dataclass
 class SellCancelConfirmedEvent:
     code: str
     remaining_holding_qty: int
@@ -120,12 +155,14 @@ class RealtimeQuote:
     low_price: int
     accumulated_volume: int
     event_time: datetime
+    open_price: int = 0
 
 
 @dataclass
 class OrderRuntimeState:
     retry_count_by_code: Dict[str, int] = field(default_factory=dict)
     first_fill_time_by_code: Dict[str, datetime] = field(default_factory=dict)
+    sell_cancel_requested_at_by_code: Dict[str, datetime] = field(default_factory=dict)
 
 
 def to_int(value: Any) -> int:
@@ -347,12 +384,18 @@ class BuySellOrderManager:
             return
 
         self._ensure_sell_level_metadata(row)
+        previous_low = to_int(row.get("직전저가")) or to_int(row.get("저가"))
         row["현재가"] = quote.current_price
+        if self._should_request_noon_low_break_partial_market_sell(row, quote, previous_low):
+            self._request_partial_market_sell(row, "12시 저가 갱신 부분청산", "12시저가부분청산완료")
         row["저가"] = quote.low_price
+        if quote.low_price > 0:
+            row["직전저가"] = quote.low_price
+        self._request_stop_limit_transition_if_needed(row)
+        self._request_stop_limit_target_market_if_needed(row)
+        self._request_stop_limit_restore_if_needed(row)
         self._request_sell_relocation_if_needed(row)
         self._update_relocated_stop_loss_from_low(row)
-        if row.get("매도전략상태") in {SELL_STRATEGY_PROFIT, SELL_STRATEGY_RELOCATED_PROFIT}:
-            self._request_profit_market_liquidation_if_needed(row)
         self.refresh_tables()
 
     def handle_buy_fill(self, event: BuyFillEvent) -> None:
@@ -363,6 +406,10 @@ class BuySellOrderManager:
         row["매수주문번호"] = event.order_no
         row["매수체결수량"] = event.cumulative_filled_qty
         row["매수미체결수량"] = event.unfilled_qty
+        if event.fill_qty > 0 and event.fill_price > 0:
+            row["매수체결금액"] = to_int(row.get("매수체결금액")) + (event.fill_qty * event.fill_price)
+            filled_qty = max(1, event.cumulative_filled_qty)
+            row["실제 매수가"] = round(to_int(row.get("매수체결금액")) / filled_qty)
 
         order_qty = to_int(row.get("매수 수량"))
         if event.cumulative_filled_qty >= order_qty and event.unfilled_qty == 0:
@@ -383,11 +430,14 @@ class BuySellOrderManager:
 
         self._ensure_sell_level_metadata(row)
         level = event.sell_level
+        fill_qty = min(event.fill_qty, max(0, to_int(row.get("잔여 수량"))))
+        if fill_qty <= 0:
+            return
         if level in {1, 2, 3}:
-            row[f"매도가{level}체결수량"] = to_int(row.get(f"매도가{level}체결수량")) + event.fill_qty
+            row[f"매도가{level}체결수량"] = to_int(row.get(f"매도가{level}체결수량")) + fill_qty
         row["잔여 수량"] = max(0, event.remaining_holding_qty)
-        row["매도 수량"] = to_int(row.get("매도 수량")) + event.fill_qty
-        row["매도 금액"] = to_int(row.get("매도 금액")) + (event.fill_qty * event.fill_price)
+        row["매도 수량"] = to_int(row.get("매도 수량")) + fill_qty
+        row["매도 금액"] = to_int(row.get("매도 금액")) + (fill_qty * event.fill_price)
         row["매도 횟수"] = to_int(row.get("매도 횟수")) + 1
         if level in {1, 2, 3}:
             self._sync_sell_level_qty_after_fill(row, level)
@@ -398,7 +448,17 @@ class BuySellOrderManager:
 
         if level in {1, 2, 3}:
             self._apply_profit_stop_loss_after_fill(row, level, event.fill_price)
-        self._request_profit_market_liquidation_if_needed(row)
+        if level == 0 and row.get("매도전략상태") in {
+            SELL_STATUS_STOP_LIMIT_ORDERED,
+            SELL_STATUS_STOP_LIMIT_RESTORE,
+            SELL_STATUS_STOP_LIMIT_TARGET_MARKET,
+            SELL_STATUS_STOP_LIMIT_CLOSE_WAIT,
+        }:
+            row["손절지정가체결수량"] = to_int(row.get("손절지정가체결수량")) + fill_qty
+        if level == 0 and row.pop("손절지정가목표시장가주문중", False) and row["잔여 수량"] > 0:
+            row["매도전략상태"] = SELL_STRATEGY_RELOCATED if row.get("매도재배치여부") else SELL_STRATEGY_NORMAL
+        self._request_stop_limit_transition_if_needed(row)
+        self._request_stop_limit_restore_if_needed(row)
         self.refresh_tables()
 
     def handle_sell_cancel_confirmed(self, event: SellCancelConfirmedEvent) -> None:
@@ -409,16 +469,37 @@ class BuySellOrderManager:
         row["잔여 수량"] = max(0, event.remaining_holding_qty)
         status = row.get("매도전략상태")
         if status == SELL_STATUS_RELOCATION_CANCEL_REQUESTED:
+            self.runtime.sell_cancel_requested_at_by_code.pop(event.code, None)
             self._complete_full_sell_relocation(row)
         elif status == SELL_STATUS_RELOCATION_LEVEL1_CANCEL_REQUESTED:
+            self.runtime.sell_cancel_requested_at_by_code.pop(event.code, None)
             self._complete_level1_sell_relocation(row)
+        elif status == SELL_STATUS_STOP_LIMIT_SWITCH:
+            self.runtime.sell_cancel_requested_at_by_code.pop(event.code, None)
+            self._complete_stop_limit_switch(row)
+        elif status == SELL_STATUS_STOP_LIMIT_READY:
+            self._request_stop_limit_transition_if_needed(row)
+            self._request_stop_limit_restore_if_needed(row)
+        elif status == SELL_STATUS_STOP_LIMIT_RESTORE:
+            self.runtime.sell_cancel_requested_at_by_code.pop(event.code, None)
+            self._complete_stop_limit_restore(row)
+        elif status == SELL_STATUS_STOP_LIMIT_TARGET_MARKET:
+            self.runtime.sell_cancel_requested_at_by_code.pop(event.code, None)
+            self._complete_stop_limit_target_market(row)
+        elif status == SELL_STATUS_STOP_LIMIT_CLOSE_WAIT:
+            self.runtime.sell_cancel_requested_at_by_code.pop(event.code, None)
+            row["매도전략상태"] = SELL_STRATEGY_RELOCATED if row.get("매도재배치여부") else SELL_STRATEGY_NORMAL
+            row["손절지정가주문번호"] = ""
+            row["손절지정가주문수량"] = 0
         elif status == SELL_STATUS_CANCEL_REQUESTED:
+            self.runtime.sell_cancel_requested_at_by_code.pop(event.code, None)
             qty = to_int(row.get("잔여 수량"))
             if qty > 0:
                 order_no = self.kiwoom.send_market_sell_order(row, qty)
                 row["시장가주문번호"] = order_no or ""
                 row["매도전략상태"] = SELL_STATUS_MARKET_REQUESTED
-                self.sell_log(f"{self._name(row)}: 익절 추적 손절 시장가 매도 요청")
+                reason = str(row.get("청산사유") or "익절 추적 손절")
+                self.sell_log(f"{self._name(row)}: {reason} 시장가 매도 요청")
         self.refresh_tables()
 
     def handle_market_sell_accepted(self, event: MarketSellAcceptedEvent) -> None:
@@ -428,6 +509,143 @@ class BuySellOrderManager:
         row["시장가주문번호"] = event.order_no
         row["매도전략상태"] = SELL_STATUS_MARKET_REQUESTED
         self.refresh_tables()
+
+    def handle_account_balance_sync(self, event: AccountBalanceSyncEvent) -> None:
+        changed = False
+        for row in list(self.list2):
+            code = str(row.get("종목코드", ""))
+            if not code:
+                continue
+            hts_qty = to_int(event.positions.get(code, 0))
+            internal_qty = to_int(row.get("잔여 수량"))
+            if hts_qty == internal_qty:
+                row["HTS 잔고수량"] = hts_qty
+                continue
+
+            row["HTS 잔고수량"] = hts_qty
+            row["잔여 수량"] = max(0, hts_qty)
+            self.sell_log(
+                f"{self._name(row)}: HTS 잔고 동기화 잔여수량 {internal_qty}주 -> {hts_qty}주"
+            )
+            changed = True
+            if hts_qty <= 0:
+                row["청산사유"] = row.get("청산사유") or "HTS 잔고 동기화"
+                if self._should_sync_trade_fills_before_summary(row):
+                    if self.kiwoom.request_trade_fill_sync(row, "HTS 잔고 0 보정"):
+                        row["매매요약대기"] = True
+                        continue
+                self._move_to_list3(row)
+
+        if changed:
+            self.refresh_tables()
+
+    def handle_trade_fill_sync(self, event: TradeFillSyncEvent) -> None:
+        row = self._find_list2_row(event.code)
+        if row is None:
+            return
+
+        current_buy_qty = to_int(row.get("매수 수량"))
+        current_buy_amount = to_int(row.get("매수체결금액")) or to_int(row.get("매수 금액"))
+        if event.buy_qty > 0:
+            row["매수 수량"] = event.buy_qty
+            if event.buy_amount > 0:
+                row["매수체결금액"] = event.buy_amount
+                row["매수 금액"] = event.buy_amount
+                row["평균 매수 금액"] = round_half_up(event.buy_amount / event.buy_qty)
+                row["매수가"] = row["평균 매수 금액"]
+            else:
+                fallback_buy_price = to_int(row.get("평균 매수 금액")) or to_int(row.get("매수가"))
+                fallback_buy_amount = fallback_buy_price * event.buy_qty
+                if fallback_buy_amount > 0:
+                    row["매수체결금액"] = fallback_buy_amount
+                    row["매수 금액"] = fallback_buy_amount
+                    row["평균 매수 금액"] = fallback_buy_price
+            if event.buy_qty != current_buy_qty:
+                self.sell_log(
+                    f"{self._name(row)}: HTS 체결내역 보정 매수수량 {current_buy_qty}주 -> {event.buy_qty}주"
+                )
+        elif current_buy_amount > 0 and current_buy_qty > 0:
+            row["평균 매수 금액"] = round_half_up(current_buy_amount / current_buy_qty)
+
+        current_sell_qty = to_int(row.get("매도 수량"))
+        current_sell_amount = to_int(row.get("매도 금액"))
+        synced_qty = event.sell_qty
+        synced_amount = event.sell_amount
+        if synced_qty > current_sell_qty:
+            row["매도 수량"] = synced_qty
+            if synced_amount > 0:
+                row["매도 금액"] = max(current_sell_amount, synced_amount)
+            else:
+                fallback_sell_price = to_int(row.get("평균 매도 금액"))
+                if fallback_sell_price <= 0 and current_sell_qty > 0 and current_sell_amount > 0:
+                    fallback_sell_price = round_half_up(current_sell_amount / current_sell_qty)
+                row["매도 금액"] = fallback_sell_price * synced_qty if fallback_sell_price > 0 else current_sell_amount
+            if to_int(row.get("매도 수량")) > 0 and to_int(row.get("매도 금액")) > 0:
+                row["평균 매도 금액"] = round_half_up(
+                    to_int(row.get("매도 금액")) / to_int(row.get("매도 수량"))
+                )
+            row["매도 횟수"] = max(to_int(row.get("매도 횟수")), 1)
+            self.sell_log(
+                f"{self._name(row)}: HTS 체결내역 보정 매도수량 {current_sell_qty}주 -> {synced_qty}주"
+            )
+        elif synced_amount > current_sell_amount:
+            row["매도 금액"] = synced_amount
+            if current_sell_qty > 0:
+                row["평균 매도 금액"] = round_half_up(synced_amount / current_sell_qty)
+        elif current_sell_amount > 0 and current_sell_qty > 0:
+            row["평균 매도 금액"] = round_half_up(current_sell_amount / current_sell_qty)
+
+        if (
+            event.average_sell_price > 0
+            and event.sell_qty > 0
+            and event.sell_qty == to_int(row.get("매도 수량"))
+        ):
+            current_average_sell_price = to_int(row.get("평균 매도 금액"))
+            row["평균 매도 금액"] = event.average_sell_price
+            if current_average_sell_price != event.average_sell_price:
+                self.sell_log(
+                    f"{self._name(row)}: HTS 평균 매도가 보정 "
+                    f"{current_average_sell_price:,}원 -> {event.average_sell_price:,}원"
+                )
+        elif event.average_sell_price > 0:
+            self.sell_log(
+                f"{self._name(row)}: HTS 평균 매도가 보정 건너뜀 "
+                f"(조회 {event.sell_qty}주, 전체 {to_int(row.get('매도 수량'))}주)"
+            )
+
+        row["HTS 체결내역보정완료"] = True
+        row.pop("매매요약대기", None)
+        if to_int(row.get("잔여 수량")) <= 0:
+            self._move_to_list3(row)
+        else:
+            self.refresh_tables()
+
+    def retry_pending_sell_action(self, code: str) -> None:
+        row = self._find_list2_row(code)
+        if row is None:
+            return
+        status = row.get("매도전략상태")
+        if status == SELL_STATUS_RELOCATION_CANCEL_REQUESTED:
+            self._request_full_sell_relocation(row)
+        elif status == SELL_STATUS_RELOCATION_LEVEL1_CANCEL_REQUESTED:
+            self._request_level1_sell_relocation(row)
+        elif status == SELL_STATUS_CANCEL_REQUESTED:
+            row["매도전략상태"] = row.pop("취소전매도전략상태", SELL_STRATEGY_NORMAL)
+            self._request_stop_limit_transition_if_needed(row)
+        elif status == SELL_STATUS_STOP_LIMIT_SWITCH:
+            self._request_stop_limit_transition_if_needed(row)
+        elif status == SELL_STATUS_STOP_LIMIT_READY:
+            self._request_stop_limit_transition_if_needed(row)
+            self._request_stop_limit_restore_if_needed(row)
+        elif status == SELL_STATUS_STOP_LIMIT_RESTORE:
+            self._request_stop_limit_restore_if_needed(row)
+        elif status == SELL_STATUS_STOP_LIMIT_TARGET_MARKET:
+            self._request_stop_limit_target_market_if_needed(row)
+        elif status in {
+            SELL_STRATEGY_RELOCATED,
+            SELL_STRATEGY_RELOCATED_PROFIT,
+        }:
+            self._request_sell_relocation_if_needed(row)
 
     def handle_buy_cancel_confirmed(self, event: BuyCancelConfirmedEvent) -> None:
         row = self._find_list1_row(event.code)
@@ -465,6 +683,15 @@ class BuySellOrderManager:
                     self.buy_log(f"{self._name(row)}: 매수 지연 취소")
                     self._request_buy_cancel(row, "매수 지연 취소")
 
+        for row in list(self.list2):
+            if row.get("모의시간고정") and not row.get("_모의테스트"):
+                continue
+            self._ensure_sell_level_metadata(row)
+            self._recover_stale_sell_cancel_request(row, now)
+            self._request_1100_partial_market_sell_if_needed(row, now)
+            self._request_stop_limit_close_wait_if_needed(row, now)
+            self._request_closing_market_liquidation_if_needed(row, now)
+
         self.refresh_tables()
 
     def _buy_wait_cancel_reason(self, row: Dict[str, Any], now: datetime) -> str:
@@ -493,6 +720,164 @@ class BuySellOrderManager:
         self.kiwoom.stop_realtime_watch(row)
         if not self.kiwoom.cancel_buy_order(row):
             self.buy_log(f"{self._name(row)}: 매수 취소 요청 실패 - {reason}")
+
+    def _request_1100_partial_market_sell_if_needed(self, row: Dict[str, Any], now: datetime) -> None:
+        if now.time() < time(11, 0, 0):
+            return
+        if to_int(row.get("매도가1체결수량")) > 0:
+            return
+        self._request_partial_market_sell(row, "11시 매도가1 미체결 부분청산", "11시부분청산완료")
+
+    def _should_request_noon_low_break_partial_market_sell(
+        self,
+        row: Dict[str, Any],
+        quote: RealtimeQuote,
+        previous_low: int,
+    ) -> bool:
+        if quote.event_time.time() < time(12, 0, 0):
+            return False
+        if row.get("12시저가부분청산완료"):
+            return False
+        if to_int(row.get("매도가1체결수량")) > 0:
+            return False
+        return previous_low > 0 and quote.current_price > 0 and quote.current_price < previous_low
+
+    def _request_partial_market_sell(self, row: Dict[str, Any], reason: str, done_key: str) -> None:
+        if row.get(done_key):
+            return
+        if row.get("감시 상태", WATCH_STATUS_ON) != WATCH_STATUS_ON:
+            return
+        if self._has_pending_sell_strategy_action(row):
+            return
+
+        holding_qty = to_int(row.get("잔여 수량"))
+        if holding_qty <= 0:
+            return
+
+        market_qty = 0
+        for level in (1, 2, 3):
+            remaining_qty = self._remaining_sell_qty_by_level(row, level)
+            cancel_qty = min(remaining_qty, round_half_up(remaining_qty / 2))
+            if cancel_qty <= 0:
+                continue
+            if not self._request_sell_level_partial_cancel(row, level, cancel_qty, reason):
+                continue
+            self._reduce_sell_level_order_qty(row, level, cancel_qty)
+            market_qty += cancel_qty
+
+        market_qty = min(market_qty, holding_qty)
+        if market_qty <= 0:
+            return
+
+        order_no = self.kiwoom.send_market_sell_order(row, market_qty)
+        self._append_market_order_no(row, order_no)
+        row[done_key] = True
+        row["청산사유"] = reason
+        self.sell_log(f"{self._name(row)}: {reason} 시장가 매도 요청 {market_qty}주")
+
+    def _request_sell_level_partial_cancel(
+        self,
+        row: Dict[str, Any],
+        level: int,
+        cancel_qty: int,
+        reason: str,
+    ) -> bool:
+        order_no = str(row.get(f"매도가{level}주문번호", ""))
+        remaining_qty = self._remaining_sell_qty_by_level(row, level)
+        if not order_no:
+            return True
+
+        if cancel_qty >= remaining_qty:
+            ok = self.kiwoom.cancel_sell_order(row, order_no)
+        else:
+            cancel_fn = getattr(self.kiwoom, "cancel_sell_order_qty", None)
+            if not callable(cancel_fn):
+                self.sell_log(f"{self._name(row)}: 매도가{level} 부분 취소 API 없음 - {reason}")
+                return False
+            ok = cancel_fn(row, order_no, cancel_qty)
+
+        if not ok:
+            self.sell_log(f"{self._name(row)}: 매도가{level} {cancel_qty}주 취소 요청 실패 - {reason}")
+            return False
+        self.sell_log(f"{self._name(row)}: 매도가{level} {cancel_qty}주 취소 요청 - {reason}")
+        return True
+
+    def _reduce_sell_level_order_qty(self, row: Dict[str, Any], level: int, cancel_qty: int) -> None:
+        ordered_qty = to_int(row.get(f"매도가{level}주문수량"))
+        filled_qty = to_int(row.get(f"매도가{level}체결수량"))
+        next_ordered_qty = max(filled_qty, ordered_qty - cancel_qty)
+        row[f"매도가{level}주문수량"] = next_ordered_qty
+        if next_ordered_qty <= filled_qty:
+            row[f"매도가{level}주문번호"] = ""
+        self._sync_sell_order_numbers(row)
+
+    def _request_closing_market_liquidation_if_needed(self, row: Dict[str, Any], now: datetime) -> None:
+        if now.time() < time(15, 29, 50):
+            return
+        if row.get("장마감청산요청완료"):
+            return
+        if row.get("감시 상태", WATCH_STATUS_ON) != WATCH_STATUS_ON:
+            return
+        if self._has_pending_sell_strategy_action(row):
+            return
+
+        holding_qty = to_int(row.get("잔여 수량"))
+        if holding_qty <= 0:
+            return
+        if not row.get("장마감잔고동기화완료"):
+            if self.kiwoom.request_account_balance_sync("장마감 청산 전"):
+                row["장마감잔고동기화완료"] = True
+                return
+
+        row["장마감청산요청완료"] = True
+        row["청산사유"] = "장마감 청산"
+        if self._has_active_sell_order(row):
+            row["매도취소대기수"] = self._active_sell_order_count(row)
+            if not self.kiwoom.cancel_sell_orders(row):
+                row["장마감청산요청완료"] = False
+                row["매도취소대기수"] = 0
+                self.sell_log(f"{self._name(row)}: 장마감 잔여 지정가 취소 요청 실패")
+                return
+            row["매도전략상태"] = SELL_STATUS_CANCEL_REQUESTED
+            self.sell_log(f"{self._name(row)}: 장마감 잔여 지정가 취소 요청")
+            return
+
+        order_no = self.kiwoom.send_market_sell_order(row, holding_qty)
+        self._append_market_order_no(row, order_no)
+        row["매도전략상태"] = SELL_STATUS_MARKET_REQUESTED
+        self.sell_log(f"{self._name(row)}: 장마감 시장가 청산 요청 {holding_qty}주")
+
+    def _has_pending_sell_strategy_action(self, row: Dict[str, Any]) -> bool:
+        return row.get("매도전략상태") in {
+            SELL_STATUS_RELOCATION_CANCEL_REQUESTED,
+            SELL_STATUS_RELOCATION_LEVEL1_CANCEL_REQUESTED,
+            SELL_STATUS_CANCEL_REQUESTED,
+            SELL_STATUS_STOP_LIMIT_SWITCH,
+            SELL_STATUS_STOP_LIMIT_READY,
+            SELL_STATUS_STOP_LIMIT_ORDERED,
+            SELL_STATUS_STOP_LIMIT_RESTORE,
+            SELL_STATUS_STOP_LIMIT_TARGET_MARKET,
+            SELL_STATUS_STOP_LIMIT_CLOSE_WAIT,
+            SELL_STATUS_MARKET_REQUESTED,
+        }
+
+    def _should_sync_trade_fills_before_summary(self, row: Dict[str, Any]) -> bool:
+        if row.get("매매요약대기"):
+            return False
+        if row.get("HTS 체결내역보정완료"):
+            return False
+        return bool(str(row.get("종목코드", "")).strip())
+
+    def _append_market_order_no(self, row: Dict[str, Any], order_no: Optional[str]) -> None:
+        if not order_no:
+            return
+        existing = [
+            value.strip()
+            for value in str(row.get("시장가주문번호", "")).split(",")
+            if value.strip()
+        ]
+        existing.append(order_no)
+        row["시장가주문번호"] = ",".join(existing)
 
     def _move_to_list2_and_send_sells(self, row: Dict[str, Any], holding_qty: int) -> None:
         list2_row = self._make_list2_row(row, holding_qty)
@@ -552,17 +937,27 @@ class BuySellOrderManager:
             SELL_STATUS_RELOCATION_CANCEL_REQUESTED,
             SELL_STATUS_RELOCATION_LEVEL1_CANCEL_REQUESTED,
             SELL_STATUS_CANCEL_REQUESTED,
+            SELL_STATUS_STOP_LIMIT_SWITCH,
+            SELL_STATUS_STOP_LIMIT_READY,
+            SELL_STATUS_STOP_LIMIT_ORDERED,
+            SELL_STATUS_STOP_LIMIT_RESTORE,
+            SELL_STATUS_STOP_LIMIT_TARGET_MARKET,
+            SELL_STATUS_STOP_LIMIT_CLOSE_WAIT,
             SELL_STATUS_MARKET_REQUESTED,
         }:
             self._remember_lower_pending_low(row)
             return
 
-        buy_price = to_int(row.get("매수가"))
+        buy_price = to_int(row.get("재배치 기준 매수가", row.get("매수가")))
         current_price = to_int(row.get("현재가"))
         low_price = to_int(row.get("저가"))
         if buy_price <= 0 or current_price <= 0 or low_price <= 0:
             return
         if current_price >= buy_price * 0.96:
+            return
+
+        if self._has_pending_sell_order(row):
+            self._remember_pending_relocation_low(row)
             return
 
         if not row.get("매도재배치여부"):
@@ -579,10 +974,13 @@ class BuySellOrderManager:
         row["재배치기준매도가수"] = self._sell_level_count(row)
         row["매도재배치대기저가"] = to_int(row.get("저가"))
         row["매도전략상태"] = SELL_STATUS_RELOCATION_CANCEL_REQUESTED
+        self._remember_sell_cancel_requested(row)
         if self._has_active_sell_order(row):
+            row["매도취소대기수"] = self._active_sell_order_count(row)
             if not self.kiwoom.cancel_sell_orders(row):
                 self.sell_log(f"{self._name(row)}: 매도 재배치 지정가 취소 요청 실패")
                 row["매도전략상태"] = SELL_STRATEGY_NORMAL
+                row["매도취소대기수"] = 0
                 return
             self.sell_log(f"{self._name(row)}: 매도 재배치 지정가 전체 취소 요청")
             return
@@ -593,11 +991,14 @@ class BuySellOrderManager:
             return
         row["매도재배치대기저가"] = to_int(row.get("저가"))
         row["매도전략상태"] = SELL_STATUS_RELOCATION_LEVEL1_CANCEL_REQUESTED
+        row["매도취소대기수"] = 1
+        self._remember_sell_cancel_requested(row)
         order_no = str(row.get("매도가1주문번호", ""))
         if order_no:
             if not self.kiwoom.cancel_sell_order(row, order_no):
                 self.sell_log(f"{self._name(row)}: 매도가1 재배치 취소 요청 실패")
                 row["매도전략상태"] = SELL_STRATEGY_RELOCATED
+                row["매도취소대기수"] = 0
                 return
             self.sell_log(f"{self._name(row)}: 매도가1 재배치 취소 요청")
             return
@@ -632,6 +1033,7 @@ class BuySellOrderManager:
         row["매도재배치여부"] = True
         row["매도재배치저가"] = low_price
         row["매도전략상태"] = SELL_STRATEGY_RELOCATED
+        row["매도취소대기수"] = 0
         self._sync_sell_order_numbers(row)
         self.sell_log(f"{self._name(row)}: 매도 재배치 완료")
 
@@ -651,6 +1053,7 @@ class BuySellOrderManager:
             row["손절가"] = low_price
         else:
             row["매도전략상태"] = SELL_STRATEGY_RELOCATED
+        row["매도취소대기수"] = 0
         self._sync_sell_order_numbers(row)
         self.sell_log(f"{self._name(row)}: 매도가1 재배치 완료")
 
@@ -666,10 +1069,52 @@ class BuySellOrderManager:
         status = row.get("매도전략상태")
         if status not in {SELL_STATUS_RELOCATION_CANCEL_REQUESTED, SELL_STATUS_RELOCATION_LEVEL1_CANCEL_REQUESTED}:
             return
+        self._remember_pending_relocation_low(row)
+
+    def _remember_pending_relocation_low(self, row: Dict[str, Any]) -> None:
         low_price = to_int(row.get("저가"))
         pending_low = to_int(row.get("매도재배치대기저가"))
         if low_price > 0 and (pending_low <= 0 or low_price < pending_low):
             row["매도재배치대기저가"] = low_price
+
+    def _remember_sell_cancel_requested(self, row: Dict[str, Any]) -> None:
+        code = str(row.get("종목코드", ""))
+        if code:
+            self.runtime.sell_cancel_requested_at_by_code[code] = datetime.now()
+
+    def _recover_stale_sell_cancel_request(self, row: Dict[str, Any], now: datetime) -> None:
+        status = row.get("매도전략상태")
+        if status not in {
+            SELL_STATUS_RELOCATION_CANCEL_REQUESTED,
+            SELL_STATUS_RELOCATION_LEVEL1_CANCEL_REQUESTED,
+            SELL_STATUS_STOP_LIMIT_SWITCH,
+            SELL_STATUS_STOP_LIMIT_RESTORE,
+            SELL_STATUS_STOP_LIMIT_TARGET_MARKET,
+            SELL_STATUS_STOP_LIMIT_CLOSE_WAIT,
+        }:
+            return
+        code = str(row.get("종목코드", ""))
+        requested_at = self.runtime.sell_cancel_requested_at_by_code.get(code)
+        if requested_at is None:
+            self.runtime.sell_cancel_requested_at_by_code[code] = now
+            return
+        if now - requested_at < timedelta(seconds=SELL_CANCEL_TIMEOUT_SECONDS):
+            return
+
+        self.runtime.sell_cancel_requested_at_by_code.pop(code, None)
+        self.sell_log(f"{self._name(row)}: {status} {SELL_CANCEL_TIMEOUT_SECONDS}초 초과 - 재배치 완료 처리")
+        if status == SELL_STATUS_RELOCATION_CANCEL_REQUESTED:
+            self._complete_full_sell_relocation(row)
+        elif status == SELL_STATUS_RELOCATION_LEVEL1_CANCEL_REQUESTED:
+            self._complete_level1_sell_relocation(row)
+        elif status == SELL_STATUS_STOP_LIMIT_SWITCH:
+            self._complete_stop_limit_switch(row)
+        elif status == SELL_STATUS_STOP_LIMIT_RESTORE:
+            self._complete_stop_limit_restore(row)
+        elif status == SELL_STATUS_STOP_LIMIT_TARGET_MARKET:
+            self._complete_stop_limit_target_market(row)
+        elif status == SELL_STATUS_STOP_LIMIT_CLOSE_WAIT:
+            row["매도전략상태"] = SELL_STRATEGY_RELOCATED if row.get("매도재배치여부") else SELL_STRATEGY_NORMAL
 
     def _update_relocated_stop_loss_from_low(self, row: Dict[str, Any]) -> None:
         if row.get("매도전략상태") != SELL_STRATEGY_RELOCATED_PROFIT:
@@ -703,6 +1148,45 @@ class BuySellOrderManager:
         row[f"매도가{level}주문번호"] = ""
         row[f"매도가{level}주문수량"] = 0
 
+    def _clear_all_sell_level_orders(self, row: Dict[str, Any], keep_prices: bool = False) -> None:
+        for level in (1, 2, 3):
+            if not keep_prices:
+                row[f"매도가{level}"] = None
+            row[f"매도가{level}주문번호"] = ""
+            row[f"매도가{level}주문수량"] = 0
+        self._sync_sell_order_numbers(row)
+
+    def _remember_restore_sell_levels(self, row: Dict[str, Any]) -> None:
+        if row.get("손절복구매도가저장완료"):
+            return
+        for level in (1, 2, 3):
+            row[f"복구매도가{level}"] = row.get(f"매도가{level}")
+            row[f"복구매도가{level}주문수량"] = self._remaining_sell_qty_by_level(row, level)
+        row["손절복구매도가저장완료"] = True
+
+    def _restore_sell_levels(self, row: Dict[str, Any]) -> None:
+        total_restored_qty = 0
+        for level in (1, 2, 3):
+            price = to_int(row.get(f"복구매도가{level}"))
+            qty = to_int(row.get(f"복구매도가{level}주문수량"))
+            qty = min(qty, max(0, to_int(row.get("잔여 수량")) - total_restored_qty))
+            if price > 0 and qty > 0:
+                row[f"매도가{level}"] = price
+                row[f"매도가{level}주문수량"] = qty
+                self._send_sell_level_order(row, level, price, qty)
+                total_restored_qty += qty
+            else:
+                self._clear_sell_level_order(row, level)
+        self._sync_sell_order_numbers(row)
+        row["손절복구매도가저장완료"] = False
+
+    def _remaining_stop_limit_qty(self, row: Dict[str, Any]) -> int:
+        ordered_qty = to_int(row.get("손절지정가주문수량"))
+        filled_qty = to_int(row.get("손절지정가체결수량"))
+        remaining = max(0, ordered_qty - filled_qty)
+        holding_qty = to_int(row.get("잔여 수량"))
+        return min(remaining if remaining > 0 else holding_qty, holding_qty)
+
     def _sell_level_count(self, row: Dict[str, Any]) -> int:
         return sum(
             1
@@ -711,6 +1195,15 @@ class BuySellOrderManager:
         )
 
     def _ensure_sell_level_metadata(self, row: Dict[str, Any]) -> None:
+        if row.get("매도전략상태") in {
+            SELL_STATUS_STOP_LIMIT_SWITCH,
+            SELL_STATUS_STOP_LIMIT_READY,
+            SELL_STATUS_STOP_LIMIT_ORDERED,
+            SELL_STATUS_STOP_LIMIT_RESTORE,
+            SELL_STATUS_STOP_LIMIT_TARGET_MARKET,
+            SELL_STATUS_STOP_LIMIT_CLOSE_WAIT,
+        }:
+            return
         if not any(to_int(row.get(f"매도가{level}주문수량")) > 0 for level in (1, 2, 3)):
             for level, (_price, qty) in enumerate(build_sell_slices(
                 to_int(row.get("잔여 수량")),
@@ -750,36 +1243,260 @@ class BuySellOrderManager:
         filled_qty = to_int(row.get(f"매도가{level}체결수량"))
         return max(0, ordered_qty - filled_qty)
 
+    def _active_sell_order_count(self, row: Dict[str, Any]) -> int:
+        count = 0
+        for level in (1, 2, 3):
+            if str(row.get(f"매도가{level}주문번호", "")) and self._remaining_sell_qty_by_level(row, level) > 0:
+                count += 1
+        return count
+
+    def _has_pending_sell_order(self, row: Dict[str, Any]) -> bool:
+        for level in (1, 2, 3):
+            order_no = str(row.get(f"매도가{level}주문번호", ""))
+            if self._is_pending_order_no(order_no) and self._remaining_sell_qty_by_level(row, level) > 0:
+                return True
+        return False
+
+    def _is_pending_order_no(self, order_no: str) -> bool:
+        return str(order_no).startswith("PENDING_")
+
+    def _decrement_pending_sell_cancel_count(self, row: Dict[str, Any]) -> int:
+        pending = to_int(row.get("매도취소대기수"))
+        if pending <= 0:
+            pending = 1
+        pending = max(0, pending - 1)
+        row["매도취소대기수"] = pending
+        return pending
+
     def _has_active_sell_order(self, row: Dict[str, Any]) -> bool:
         for level in (1, 2, 3):
             if str(row.get(f"매도가{level}주문번호", "")) and self._remaining_sell_qty_by_level(row, level) > 0:
                 return True
         return bool(str(row.get("매도주문번호들", "")))
 
-    def _request_profit_market_liquidation_if_needed(self, row: Dict[str, Any]) -> None:
+    def _request_stop_limit_transition_if_needed(self, row: Dict[str, Any]) -> None:
         current_price = to_int(row.get("현재가"))
         stop_price = to_int(row.get("손절가"))
         holding_qty = to_int(row.get("잔여 수량"))
         if current_price <= 0 or stop_price <= 0 or holding_qty <= 0:
             return
-        if current_price > stop_price:
+
+        status = row.get("매도전략상태")
+        if status == SELL_STATUS_STOP_LIMIT_READY:
+            if current_price <= stop_price:
+                self._complete_stop_limit_switch(row)
             return
-        if row.get("매도전략상태") in {
+
+        if current_price > stop_price * 1.02:
+            return
+        if status in {
             SELL_STATUS_CANCEL_REQUESTED,
             SELL_STATUS_MARKET_REQUESTED,
             SELL_STATUS_RELOCATION_CANCEL_REQUESTED,
             SELL_STATUS_RELOCATION_LEVEL1_CANCEL_REQUESTED,
+            SELL_STATUS_STOP_LIMIT_SWITCH,
+            SELL_STATUS_STOP_LIMIT_READY,
+            SELL_STATUS_STOP_LIMIT_ORDERED,
+            SELL_STATUS_STOP_LIMIT_RESTORE,
+            SELL_STATUS_STOP_LIMIT_TARGET_MARKET,
+            SELL_STATUS_STOP_LIMIT_CLOSE_WAIT,
         }:
             return
 
-        row["매도전략상태"] = SELL_STATUS_CANCEL_REQUESTED
-        row["청산사유"] = "익절 추적 손절"
-        if not self.kiwoom.cancel_sell_orders(row):
-            self.sell_log(f"{self._name(row)}: 잔여 지정가 매도 취소 요청 실패")
+        self._remember_restore_sell_levels(row)
+        row["청산사유"] = "손절 지정가"
+        row["매도전략상태"] = SELL_STATUS_STOP_LIMIT_SWITCH
+        self._remember_sell_cancel_requested(row)
+
+        if self._has_active_sell_order(row):
+            row["매도취소대기수"] = self._active_sell_order_count(row)
+            if not self.kiwoom.cancel_sell_orders(row):
+                self.sell_log(f"{self._name(row)}: 손절 지정가 전환 취소 요청 실패")
+                row["매도전략상태"] = SELL_STRATEGY_RELOCATED if row.get("매도재배치여부") else SELL_STRATEGY_NORMAL
+                row["매도취소대기수"] = 0
+                return
+            self.sell_log(f"{self._name(row)}: 손절 지정가 전환 - 기존 지정가 취소 요청")
             return
-        self.sell_log(f"{self._name(row)}: 잔여 지정가 취소 요청 - 익절 추적 손절")
+
+        self.kiwoom.cancel_sell_orders(row)
+        self._complete_stop_limit_switch(row)
+
+    def _complete_stop_limit_switch(self, row: Dict[str, Any]) -> None:
+        qty = to_int(row.get("잔여 수량"))
+        stop_price = to_int(row.get("손절가"))
+        current_price = to_int(row.get("현재가"))
+        if qty <= 0 or stop_price <= 0:
+            row["매도전략상태"] = SELL_STRATEGY_RELOCATED if row.get("매도재배치여부") else SELL_STRATEGY_NORMAL
+            return
+        self._clear_all_sell_level_orders(row, keep_prices=True)
+        if current_price > stop_price:
+            row["손절지정가주문번호"] = ""
+            row["손절지정가주문수량"] = 0
+            row["손절지정가체결수량"] = 0
+            row["매도전략상태"] = SELL_STATUS_STOP_LIMIT_READY
+            row["매도취소대기수"] = 0
+            self.sell_log(f"{self._name(row)}: 손절 지정가 대기 {stop_price:,}원/{qty}주")
+            return
+        row["손절지정가주문수량"] = qty
+        row["손절지정가체결수량"] = to_int(row.get("손절지정가체결수량"))
+        row["손절지정가요청중"] = True
+        row["손절지정가주문번호"] = self.kiwoom.send_sell_order(row, stop_price, qty) or ""
+        row["매도전략상태"] = SELL_STATUS_STOP_LIMIT_ORDERED
+        row["매도취소대기수"] = 0
+        self.sell_log(f"{self._name(row)}: 손절 지정가 주문 요청 {stop_price:,}원/{qty}주")
+
+    def _request_stop_limit_target_market_if_needed(self, row: Dict[str, Any]) -> None:
+        if row.get("매도전략상태") != SELL_STATUS_STOP_LIMIT_ORDERED:
+            return
+        if to_int(row.get("손절지정가체결수량")) > 0:
+            return
+        current_price = to_int(row.get("현재가"))
+        stop_price = to_int(row.get("손절가"))
+        if current_price <= 0 or stop_price <= 0:
+            return
+        if current_price >= stop_price * 1.035:
+            return
+
+        trigger = self._stop_limit_target_market_trigger(row, stop_price, current_price)
+        if trigger is None:
+            return
+        level, target_price, target_qty = trigger
+        if target_qty <= 0:
+            return
+
+        row["손절지정가목표시장가단계"] = level
+        row["손절지정가목표시장가수량"] = target_qty
+        row["손절지정가목표시장가가격"] = target_price
+        row["청산사유"] = f"손절 지정가 중 매도가{level} 도달"
+        row["매도전략상태"] = SELL_STATUS_STOP_LIMIT_TARGET_MARKET
+        self._remember_sell_cancel_requested(row)
+
+        order_no = str(row.get("손절지정가주문번호", ""))
+        if not order_no:
+            self._complete_stop_limit_target_market(row)
+            return
+        qty = self._remaining_stop_limit_qty(row)
+        if not self.kiwoom.cancel_sell_order_qty(row, order_no, qty):
+            row["매도전략상태"] = SELL_STATUS_STOP_LIMIT_ORDERED
+            self.sell_log(f"{self._name(row)}: 손절 지정가 목표가 전환 취소 요청 실패")
+            return
+        self.sell_log(
+            f"{self._name(row)}: 손절 지정가 취소 요청 - 매도가{level} 시장가 전환"
+        )
+
+    def _stop_limit_target_market_trigger(
+        self,
+        row: Dict[str, Any],
+        stop_price: int,
+        current_price: int,
+    ) -> Optional[Tuple[int, int, int]]:
+        lower = stop_price * 1.02
+        upper = stop_price * 1.035
+        for level in (1, 2, 3):
+            target_price = to_int(row.get(f"복구매도가{level}"))
+            if not (lower < target_price < upper):
+                continue
+            if current_price < target_price:
+                continue
+            qty = min(
+                to_int(row.get(f"복구매도가{level}주문수량")),
+                to_int(row.get("잔여 수량")),
+            )
+            if qty > 0:
+                return level, target_price, qty
+        return None
+
+    def _complete_stop_limit_target_market(self, row: Dict[str, Any]) -> None:
+        qty = min(
+            to_int(row.pop("손절지정가목표시장가수량", 0)),
+            to_int(row.get("잔여 수량")),
+        )
+        level = to_int(row.pop("손절지정가목표시장가단계", 0))
+        target_price = to_int(row.pop("손절지정가목표시장가가격", 0))
+        row["손절지정가주문번호"] = ""
+        row["손절지정가주문수량"] = 0
+        row["손절지정가체결수량"] = 0
+        if qty <= 0:
+            row["매도전략상태"] = SELL_STRATEGY_RELOCATED if row.get("매도재배치여부") else SELL_STRATEGY_NORMAL
+            return
+        order_no = self.kiwoom.send_market_sell_order(row, qty)
+        self._append_market_order_no(row, order_no)
+        row["매도전략상태"] = SELL_STATUS_MARKET_REQUESTED
+        row["손절지정가목표시장가주문중"] = True
+        self.sell_log(
+            f"{self._name(row)}: 매도가{level} {target_price:,}원 도달 시장가 매도 요청 {qty}주"
+        )
+
+    def _request_stop_limit_restore_if_needed(self, row: Dict[str, Any]) -> None:
+        if row.get("매도전략상태") not in {SELL_STATUS_STOP_LIMIT_READY, SELL_STATUS_STOP_LIMIT_ORDERED}:
+            return
+        if to_int(row.get("손절지정가체결수량")) > 0:
+            return
+        current_price = to_int(row.get("현재가"))
+        stop_price = to_int(row.get("손절가"))
+        if current_price <= 0 or stop_price <= 0:
+            return
+        if current_price < stop_price * 1.035:
+            return
+
+        order_no = str(row.get("손절지정가주문번호", ""))
+        if row.get("매도전략상태") == SELL_STATUS_STOP_LIMIT_READY:
+            self._complete_stop_limit_restore(row)
+            return
+        if not order_no:
+            self.kiwoom.cancel_sell_orders(row)
+            self._complete_stop_limit_restore(row)
+            return
+        row["매도전략상태"] = SELL_STATUS_STOP_LIMIT_RESTORE
+        self._remember_sell_cancel_requested(row)
+        qty = self._remaining_stop_limit_qty(row)
+        if not self.kiwoom.cancel_sell_order_qty(row, order_no, qty):
+            self.sell_log(f"{self._name(row)}: 손절 지정가 복구 취소 요청 실패")
+            row["매도전략상태"] = SELL_STATUS_STOP_LIMIT_ORDERED
+            return
+        self.sell_log(f"{self._name(row)}: 손절 지정가 취소 요청 - 매도가 복구")
+
+    def _complete_stop_limit_restore(self, row: Dict[str, Any]) -> None:
+        if to_int(row.get("손절지정가체결수량")) > 0:
+            row["매도전략상태"] = SELL_STATUS_STOP_LIMIT_ORDERED
+            return
+        row["손절지정가주문번호"] = ""
+        row["손절지정가주문수량"] = 0
+        row["손절지정가체결수량"] = 0
+        self._restore_sell_levels(row)
+        row["매도전략상태"] = SELL_STRATEGY_RELOCATED if row.get("매도재배치여부") else SELL_STRATEGY_NORMAL
+        self.sell_log(f"{self._name(row)}: 손절 지정가 취소 완료 - 매도가 복구")
+
+    def _request_stop_limit_close_wait_if_needed(self, row: Dict[str, Any], now: datetime) -> None:
+        if now.time() < time(15, 20, 0):
+            return
+        if row.get("매도전략상태") != SELL_STATUS_STOP_LIMIT_ORDERED:
+            return
+        if to_int(row.get("잔여 수량")) <= 0:
+            return
+        order_no = str(row.get("손절지정가주문번호", ""))
+        if not order_no:
+            self.kiwoom.cancel_sell_orders(row)
+            row["매도전략상태"] = SELL_STRATEGY_RELOCATED if row.get("매도재배치여부") else SELL_STRATEGY_NORMAL
+            return
+        row["매도전략상태"] = SELL_STATUS_STOP_LIMIT_CLOSE_WAIT
+        self._remember_sell_cancel_requested(row)
+        qty = self._remaining_stop_limit_qty(row)
+        if not self.kiwoom.cancel_sell_order_qty(row, order_no, qty):
+            self.sell_log(f"{self._name(row)}: 15:20 손절 지정가 취소 요청 실패")
+            row["매도전략상태"] = SELL_STATUS_STOP_LIMIT_ORDERED
+            return
+        self.sell_log(f"{self._name(row)}: 15:20 손절 지정가 취소 요청 - 장마감 청산 대기")
+
+    def _request_profit_market_liquidation_if_needed(self, row: Dict[str, Any]) -> None:
+        self._request_stop_limit_transition_if_needed(row)
 
     def _move_to_list3(self, row: Dict[str, Any]) -> None:
+        if self._should_sync_trade_fills_before_summary(row):
+            if self.kiwoom.request_trade_fill_sync(row, "매매요약 전 보정"):
+                row["매매요약대기"] = True
+                self.refresh_tables()
+                return
         summary = self._make_list3_row(row)
         self.list3.append(summary)
         self._remove_list2_row(row)
@@ -792,10 +1509,13 @@ class BuySellOrderManager:
         return summary
 
     def _make_list2_row(self, row: Dict[str, Any], holding_qty: int) -> Dict[str, Any]:
+        input_buy_price = row.get("재배치 기준 매수가", row.get("매수가"))
+        actual_buy_price = row.get("실제 매수가") or row.get("매수가")
         return {
             "종목코드": row.get("종목코드", ""),
             "종목명": row.get("종목명", ""),
-            "매수가": row.get("매수가"),
+            "매수가": actual_buy_price,
+            "재배치 기준 매수가": input_buy_price,
             "매수 수량": holding_qty,
             "잔여 수량": holding_qty,
             "매도 횟수": 0,
@@ -807,14 +1527,26 @@ class BuySellOrderManager:
             "손절가": row.get("손절가"),
             "매도 금액": 0,
             "매수주문번호": row.get("매수주문번호", ""),
+            "매수체결금액": row.get("매수체결금액", 0),
             "매도주문번호들": "",
             "매도전략상태": SELL_STRATEGY_NORMAL,
+            "매도취소대기수": 0,
             "매도가1체결수량": 0,
             "매도가2체결수량": 0,
             "매도가3체결수량": 0,
             "매도 수량": 0,
             "시장가주문번호": "",
             "청산사유": "",
+            "손절지정가주문번호": "",
+            "손절지정가주문수량": 0,
+            "손절지정가체결수량": 0,
+            "손절복구매도가저장완료": False,
+            "복구매도가1": row.get("매도가1"),
+            "복구매도가2": row.get("매도가2"),
+            "복구매도가3": row.get("매도가3"),
+            "복구매도가1주문수량": 0,
+            "복구매도가2주문수량": 0,
+            "복구매도가3주문수량": 0,
             "감시 상태": WATCH_STATUS_ON,
             "매도가1주문번호": "",
             "매도가2주문번호": "",
@@ -828,6 +1560,10 @@ class BuySellOrderManager:
             "재배치기준매도가1": 0,
             "재배치기준매도가2": 0,
             "재배치기준매도가수": 0,
+            "직전저가": row.get("저가"),
+            "11시부분청산완료": False,
+            "12시저가부분청산완료": False,
+            "장마감청산요청완료": False,
         }
 
     def _handle_buy_order_request_failed(self, row: Dict[str, Any], reason: str) -> None:
@@ -880,3 +1616,8 @@ class BuySellOrderManager:
 
     def _name(self, row: Dict[str, Any]) -> str:
         return str(row.get("종목명") or row.get("종목코드") or "")
+
+
+
+
+
